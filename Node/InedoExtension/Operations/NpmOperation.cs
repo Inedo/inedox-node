@@ -2,9 +2,9 @@
 using System.Text.RegularExpressions;
 using Inedo.Agents;
 using Inedo.ExecutionEngine.Executer;
+using Inedo.Extensions.DotNet.SuggestionProviders;
 using Inedo.Extensions.PackageSources;
 using Inedo.IO;
-using Inedo.ProGet;
 using Inedo.Web;
 
 namespace Inedo.Extension.Node.Operations;
@@ -63,63 +63,87 @@ public abstract class NpmOperation : ExecuteOperation
     [Description("Self-signed certificates and internal Certificate Authority (CA) generated certificates are considered invalid by default in npm's certificate validation process.  Enabling this option will by-pass certificate validation in npm.")]
     public bool AllowSelfSignedCertificate { get; set; }
 
+    [ScriptAlias("ImageBasedService")]
+    [SuggestableValue(typeof(NodeIBSSuggestionProvider))]
+    public string? ImageBasedService { get; set; }
+
+    private bool UseContainer => !string.IsNullOrEmpty(this.ImageBasedService);
+
     private static readonly LazyRegex LogMessageRegex = new(@"npm\s(?<1>[a-zA-Z]+!?)(?<2>\s.*)?$");
 
     protected async Task<int?> ExecuteNpmAsync(string command, string? commandArgs, IOperationExecutionContext context)
     {
         this.LogInformation($"Executing npm {command}");
-        var npmPath = await this.GetNpmExePathAsync(context);
 
         var fileOps = await context.Agent.GetServiceAsync<IFileOperationsExecuter>();
-        var sourceDirectory = context.ResolvePath(this.SourceDirectory ?? context.WorkingDirectory);
-
-        await fileOps.CreateDirectoryAsync(sourceDirectory);
         var execProcess = await context.Agent.GetServiceAsync<IRemoteProcessExecuter>();
-        var npmrcPath = await getNpmrcPathAsync();
-        if (this.Verbose)
+        var sourceDirectory = context.ResolvePath(this.SourceDirectory ?? context.WorkingDirectory);
+        await fileOps.CreateDirectoryAsync(sourceDirectory);
+
+        int exitCode;
+        IDockerHost? docker = null;
+        string npmPath;
+
+        if (this.UseContainer)
         {
-            commandArgs += " --loglevel verbose";
-            this.LogDebug($"Executing {npmPath} {command} {commandArgs} {npmrcPath}");
+            npmPath = "npm";
+            this.LogDebug($"Using \"{this.ImageBasedService}\" image based service.");
+            docker = (await context.TryGetServiceAsync<IDockerHost>()) ?? throw new ExecutionFailureException("Docker is not available on this server.");
+
+            var npmrcPath = await getNpmrcPathAsync();
+            if (this.Verbose)
+            {
+                commandArgs += " --loglevel verbose";
+                this.LogDebug($"Executing {npmPath} {command} {commandArgs} {npmrcPath}");
+            }
+
+            exitCode = await docker.ExecuteInContainerAsync(
+                new ContainerStartInfo(
+                    Image: this.ImageBasedService!,
+                    StartInfo: new RemoteProcessStartInfo
+                    {
+                        FileName = "npm",
+                        Arguments = $"{command} {commandArgs} {npmrcPath}",
+                        WorkingDirectory = docker.ResolveContainerPath(sourceDirectory),
+                        UseUTF8ForStandardOutput = true,
+                        UseUTF8ForStandardError = true
+                    },
+                    OutputDataReceived: this.LogDebug,
+                    ErrorDataReceived: this.LogNodeError
+                )
+            );
         }
-        using var process = execProcess.CreateProcess(
-            new RemoteProcessStartInfo
-            {
-                FileName = npmPath,
-                Arguments = $"{command} {commandArgs} {npmrcPath}",
-                WorkingDirectory = sourceDirectory,
-                UseUTF8ForStandardOutput = true,
-                UseUTF8ForStandardError = true
-            }
-        );
-
-        process.OutputDataReceived += (s, e) => this.LogDebug(e.Data);
-        process.ErrorDataReceived += (s, e) =>
+        else
         {
-            var m = LogMessageRegex.Match(e.Data);
-            if (m.Success)
+            npmPath = await this.GetNpmExePathAsync(context);
+
+            var npmrcPath = await getNpmrcPathAsync();
+            if (this.Verbose)
             {
-                var level = m.Groups[1].Value.ToLower() switch
-                {
-                    "debug" => MessageLevel.Debug,
-                    "info" => MessageLevel.Information,
-                    "warning" or "warn" => MessageLevel.Warning,
-                    "err!" or "error" or "critical" => MessageLevel.Error,
-                    _ => MessageLevel.Debug
-                };
-                if(this.Verbose)
-                    this.Log(level, e.Data);
-                else
-                    this.Log(level, m.Groups[2].Value);
+                commandArgs += " --loglevel verbose";
+                this.LogDebug($"Executing {npmPath} {command} {commandArgs} {npmrcPath}");
             }
-            else if (e.Data != null)
-                this.Log(MessageLevel.Debug, e.Data);
-        };
 
-        await process.StartAsync(context.CancellationToken);
+            using var process = execProcess.CreateProcess(
+                new RemoteProcessStartInfo
+                {
+                    FileName = npmPath,
+                    Arguments = $"{command} {commandArgs} {npmrcPath}",
+                    WorkingDirectory = sourceDirectory,
+                    UseUTF8ForStandardOutput = true,
+                    UseUTF8ForStandardError = true
+                }
+            );
 
-        await process.WaitAsync(context.CancellationToken);
+            process.OutputDataReceived += (s, e) => this.LogDebug(e.Data);
+            process.ErrorDataReceived += (s, e) => this.LogNodeError(e.Data);
 
-        var exitCode = process.ExitCode.GetValueOrDefault();
+            await process.StartAsync(context.CancellationToken);
+
+            await process.WaitAsync(context.CancellationToken);
+
+            exitCode = process.ExitCode.GetValueOrDefault();
+        }
 
         bool exitCodeLogged = false;
 
@@ -136,8 +160,9 @@ public abstract class NpmOperation : ExecuteOperation
                 exitCodeLogged = true;
             }
         }
+
         if (!exitCodeLogged)
-            this.LogDebug("Script exited with code: " + exitCode);
+            this.LogDebug($"Script exited with code: {exitCode}");
         
         return exitCode;
 
@@ -163,22 +188,44 @@ public abstract class NpmOperation : ExecuteOperation
         async Task<string> getNpmVersionAsync()
         {
             var version = string.Empty;
-            using var process = execProcess.CreateProcess(
-                new RemoteProcessStartInfo
-                {
-                    FileName = npmPath,
-                    Arguments = "--version",
-                    WorkingDirectory = sourceDirectory,
-                    UseUTF8ForStandardOutput = true,
-                    UseUTF8ForStandardError = true,
 
-                }
-            );
-            process.OutputDataReceived += (s, e) => version += e.Data ?? string.Empty;
-            process.ErrorDataReceived += (s, e) => version += e.Data ?? string.Empty;
+            if (docker == null)
+            {
+                using var process = execProcess.CreateProcess(
+                    new RemoteProcessStartInfo
+                    {
+                        FileName = npmPath,
+                        Arguments = "--version",
+                        WorkingDirectory = sourceDirectory,
+                        UseUTF8ForStandardOutput = true,
+                        UseUTF8ForStandardError = true,
 
-            await process.StartAsync(context.CancellationToken);
-            await process.WaitAsync(context.CancellationToken);
+                    }
+                );
+                process.OutputDataReceived += (s, e) => version += e.Data ?? string.Empty;
+                process.ErrorDataReceived += (s, e) => version += e.Data ?? string.Empty;
+
+                await process.StartAsync(context.CancellationToken);
+                await process.WaitAsync(context.CancellationToken);
+            }
+            else
+            {
+                await docker.ExecuteInContainerAsync(
+                    new ContainerStartInfo(
+                        Image: this.ImageBasedService!,
+                        StartInfo: new RemoteProcessStartInfo
+                        {
+                            FileName = "npm",
+                            Arguments = "--version",
+                            WorkingDirectory = docker.ResolveContainerPath(sourceDirectory),
+                            UseUTF8ForStandardOutput = true,
+                            UseUTF8ForStandardError = true
+                        },
+                        OutputDataReceived: t => version += t,
+                        ErrorDataReceived: t => version += t
+                    )
+                );
+            }
 
             return version.Trim();
         }
@@ -247,7 +294,7 @@ public abstract class NpmOperation : ExecuteOperation
                     return string.Empty;
 
                 var version = await getNpmVersionAsync();
-                
+
                 // ExtensionVersion is basically a copy SemVer2, using this to parse the npm version to see if it should use the new auth style
                 var useV9 = ExtensionVersion.TryParse(version)?.Major >= 9;
 
@@ -264,13 +311,47 @@ public abstract class NpmOperation : ExecuteOperation
                 else
                     await createNpmrcV8Async(npmrcPath, nnnnnnpm);
 
+                if (docker != null)
+                    npmrcPath = docker.ResolveContainerPath(npmrcPath);
+
                 this.LogDebug("Created.");
                 return $"--userconfig=\"{npmrcPath}\"";
             }
             else if (!string.IsNullOrWhiteSpace(this.NpmrcPath))
-                return $"--userconfig=\"{this.NpmrcPath}\"";
+            {
+                var p = docker != null ? docker.ResolveContainerPath(this.NpmrcPath) : this.NpmrcPath;
+                return $"--userconfig=\"{p}\"";
+            }
 
             return string.Empty;
+        }
+    }
+
+    private void LogNodeError(string text)
+    {
+        if (text == null)
+            return;
+
+        var m = LogMessageRegex.Match(text);
+        if (m.Success)
+        {
+            var level = m.Groups[1].Value.ToLowerInvariant() switch
+            {
+                "debug" => MessageLevel.Debug,
+                "info" => MessageLevel.Information,
+                "warning" or "warn" => MessageLevel.Warning,
+                "err!" or "error" or "critical" => MessageLevel.Error,
+                _ => MessageLevel.Debug
+            };
+
+            if (this.Verbose)
+                this.Log(level, text);
+            else
+                this.Log(level, m.Groups[2].Value);
+        }
+        else if (text != null)
+        {
+            this.Log(MessageLevel.Debug, text);
         }
     }
 
