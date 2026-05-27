@@ -366,6 +366,8 @@ public abstract class NpmOperation : ExecuteOperation
 
         public PackageSourceId SourceId { get; set; }
 
+        public string PackageType => "npm";
+
         public NpmUrlPackageSource(PackageSourceId sourceId)
         {
             this.SourceId = sourceId;
